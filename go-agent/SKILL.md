@@ -1,6 +1,6 @@
 ---
 name: Go Agent
-description: Scaffold a complete Go agent using the OpenAI SDK. Covers structured responses, tools, multi-turn conversation, memory, and optional LLP observability.
+description: Scaffold a complete Go agent using the OpenAI SDK. Covers structured responses, tools, required in-session conversation history for multi-turn behavior, optional persistent memory, and optional LLP observability.
 license: MIT
 metadata:
     author: Large Language Platform, Inc.
@@ -14,7 +14,7 @@ Scaffold a complete, runnable Go agent using the OpenAI SDK.
 ## When to use
 
 - When building an agent in Go using the OpenAI SDK.
-- When you want structured responses, tool calling, and optional conversation history with minimal dependencies.
+- When you want structured responses, tool calling, and multi-turn behavior with in-session conversation history and minimal dependencies.
 
 ---
 
@@ -22,18 +22,20 @@ Scaffold a complete, runnable Go agent using the OpenAI SDK.
 
 ### Step 1 — Gather requirements
 
-Ask the user for the following. Do not proceed until all required items are answered.
+Ask only for the minimum needed to scaffold a useful first version. Do not block on optional details.
 
 **Required:**
 1. **Agent name** — snake_case (e.g. `loan_advisor`, `code_reviewer`)
 2. **Domain** — one sentence describing what the agent specialises in
-3. **Model** — default: `gpt-4o-mini`
-4. **Tools** — list the tools this agent needs. For each: name, description, inputs, return value. If the agent needs no tools, confirm this explicitly.
+3. **Tools** — list the tools this agent needs. For each: name, description, inputs, return value. If the agent needs no tools, require the user to confirm that explicitly.
 
 **Optional:**
+4. **Model** — default: `gpt-4o-mini`
 5. **Response schema** — what structured data should the agent return? Default: derive from domain.
-6. **Multi-turn** — maintain conversation history within a session? Default: no.
-7. **Memory** — persist memory across sessions? Default: no.
+6. **Persistent memory** — persist memory across sessions? Default: no.
+7. **LLP observability** — include LLP connectivity? Default: no.
+
+If the user does not specify an optional item, proceed with the default and note the assumption briefly. Do not proceed until the required tools input is provided. An explicit "no tools" answer satisfies that requirement and should produce an agent with no tool definitions or tool loop configuration.
 
 ---
 
@@ -114,20 +116,7 @@ func dispatchTool(name string, input json.RawMessage) string {
 
 #### D. Agent struct
 
-```go
-type Agent struct {
-    model  string
-    // SDK client — see Step 3
-}
-
-func NewAgent() *Agent {
-    model := os.Getenv("MODEL_NAME")
-    if model == "" {
-        model = "gpt-4o-mini"
-    }
-    return &Agent{model: model}
-}
-```
+The `Agent` struct and `NewAgent()` constructor are SDK-specific — see Step 3 for the full definition.
 
 #### E. Response parsing
 
@@ -164,11 +153,21 @@ func formatDecline(r *AgentResponse) string {
 
 ```go
 func buildPrompt(message string) string {
-    return message + "\n\nReturn ONLY valid JSON matching the required schema."
+    return message
 }
 ```
 
-#### H. Entry point
+#### H. Conversation history
+
+Maintain conversation history per session keyed by a stable sender or session identifier.
+
+**Key rule:** the system prompt is never stored in history — it is prepended fresh on every call. This keeps it authoritative and prevents it from being diluted as context grows.
+
+See `processMessage` in Step 3 for the full implementation.
+
+#### I. Entry point
+
+Requires `github.com/joho/godotenv` in your import block.
 
 ```go
 func main() {
@@ -194,9 +193,9 @@ Env defaults:
 **Import:**
 ```go
 import (
+    "sync"
     "github.com/openai/openai-go"
     "github.com/openai/openai-go/option"
-    "github.com/joho/godotenv"
 )
 ```
 
@@ -213,9 +212,9 @@ type Agent struct {
 }
 ```
 
-**Tool definitions:**
+**Tool definitions** — declare as a package-level variable so it's accessible from both `main()` and `handleMessage()`:
 ```go
-toolDefs := []openai.ChatCompletionToolParam{{
+var toolDefs = []openai.ChatCompletionToolParam{{
     Type: "function",
     Function: openai.FunctionDefinitionParam{
         Name:        "tool_name",
@@ -264,13 +263,78 @@ func (a *Agent) call(ctx context.Context, messages []openai.ChatCompletionMessag
 }
 ```
 
-**Multi-turn:** Maintain a `[]openai.ChatCompletionMessageParamUnion` slice per session. Append user and assistant turns after each exchange.
+**Multi-turn:** Maintain a `[]openai.ChatCompletionMessageParamUnion` slice per session. Append raw user and assistant turns after each exchange.
 
-**Build initial messages slice from a prompt string:**
+**Build messages slice — system prompt prepended fresh, history in the middle:**
 ```go
-func buildMessages(prompt string) []openai.ChatCompletionMessageParamUnion {
-    return []openai.ChatCompletionMessageParamUnion{
-        openai.UserMessage(buildPrompt(prompt)),
+func buildMessages(prompt string, history []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
+    msgs := []openai.ChatCompletionMessageParamUnion{openai.SystemMessage(SYSTEM_PROMPT)}
+    msgs = append(msgs, history...)
+    msgs = append(msgs, openai.UserMessage(buildPrompt(prompt)))
+    return msgs
+}
+```
+
+**Process a message:**
+```go
+type sessionStore struct {
+    mu   sync.RWMutex
+    data map[string][]openai.ChatCompletionMessageParamUnion
+}
+
+func newSessionStore() *sessionStore {
+    return &sessionStore{
+        data: make(map[string][]openai.ChatCompletionMessageParamUnion),
+    }
+}
+
+func (s *sessionStore) Get(sessionID string) []openai.ChatCompletionMessageParamUnion {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+
+    history := s.data[sessionID]
+    out := make([]openai.ChatCompletionMessageParamUnion, len(history))
+    copy(out, history)
+    return out
+}
+
+func (s *sessionStore) Set(sessionID string, history []openai.ChatCompletionMessageParamUnion) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    next := make([]openai.ChatCompletionMessageParamUnion, len(history))
+    copy(next, history)
+    s.data[sessionID] = next
+}
+
+var sessions = newSessionStore()
+
+func processMessage(agent *Agent, sessionID, prompt string) string {
+    history := sessions.Get(sessionID)
+
+    rawText, err := agent.call(context.Background(), buildMessages(prompt, history), toolDefs)
+    if err != nil {
+        return "I'm sorry, I encountered an error processing your request."
+    }
+
+    history = append(history,
+        openai.UserMessage(prompt),
+        openai.AssistantMessage(rawText),
+    )
+    if len(history) > 40 {
+        history = history[2:]
+    }
+    sessions.Set(sessionID, history)
+
+    resp, err := parseResponse(rawText)
+    if err != nil {
+        return "I'm sorry, I encountered an error processing your request."
+    }
+
+    switch resp.Type {
+    case "capabilities": return formatCapabilities()
+    case "decline":      return formatDecline(resp)
+    default:             return formatResult(resp)
     }
 }
 ```
@@ -279,13 +343,9 @@ func buildMessages(prompt string) []openai.ChatCompletionMessageParamUnion {
 
 ### Step 4 — Optional building blocks
 
-#### Multi-turn conversation
+#### Persistent memory across sessions
 
-Maintain conversation history scoped to the session, keyed by a stable session or sender identifier. Append user prompt and assistant response after each successful LLM call. Cap history to avoid token bloat (e.g. drop oldest pair at 20 turns).
-
-#### Memory across sessions
-
-For in-session memory only, conversation history above is sufficient.
+In-session conversation history above is what enables multi-turn behavior.
 
 For persistent memory across sessions, store and retrieve keyed by a stable user or session identifier:
 - **Simple:** serialise history to a JSON file on disk
@@ -302,19 +362,16 @@ Add LLP platform connectivity for managed routing, tool-call tracing, and observ
 
 **Add dependency:** `github.com/llpsdk/llp-go`
 
-**Implement `handleMessage(agent, message, annotater)`:**
+**Implement `handleMessage(agent, msg)`:**
 
 ```
-1. Derive corrId from message (e.g. message.ID[:8])
-2. Log: [corrId] >>> RECV from=<sender> prompt="<first 80 chars>"
-3. Build messages slice and call agent
-4. Parse response
-5. Log: [corrId] === type=<type>
-6. Switch on type → format → return string
-7. On error: log [corrId] !!! → return safe fallback string
+1. Build messages slice and call agent
+2. Parse response
+3. Switch on type → format → return string
+4. On error: return safe fallback string
 ```
 
-**Helper functions required by the observability layer:**
+**Utility helper** — add this alongside the other helpers:
 ```go
 func getEnv(key, fallback string) string {
     if v := os.Getenv(key); v != "" {
@@ -322,34 +379,36 @@ func getEnv(key, fallback string) string {
     }
     return fallback
 }
+```
 
-func truncate(s string, n int) string {
-    if len(s) <= n {
-        return s
-    }
-    return s[:n]
-}
+`handleMessage` is the LLP equivalent of `processMessage` — it replaces it when using LLP, reusing the same session store keyed by `msg.Sender`:
+```go
+var sessions = newSessionStore()
 ```
 
 ```go
-func handleMessage(agent *Agent, msg llp.TextMessage, annotater llp.Annotater) string {
-    corrId := msg.ID
-    if len(corrId) > 8 { corrId = corrId[:8] }
-    log.Printf("[%s] >>> RECV from=%s prompt=%q", corrId, msg.Sender, truncate(msg.Prompt, 80))
+func handleMessage(agent *Agent, msg llp.TextMessage) string {
+    history := sessions.Get(msg.Sender)
 
-    rawText, err := agent.call(context.Background(), buildMessages(msg.Prompt), toolDefs)
+    rawText, err := agent.call(context.Background(), buildMessages(msg.Prompt, history), toolDefs)
     if err != nil {
-        log.Printf("[%s] !!! error=%v", corrId, err)
         return "I'm sorry, I encountered an error processing your request."
     }
+
+    history = append(history,
+        openai.UserMessage(msg.Prompt),
+        openai.AssistantMessage(rawText),
+    )
+    if len(history) > 40 {
+        history = history[2:]
+    }
+    sessions.Set(msg.Sender, history)
 
     resp, err := parseResponse(rawText)
     if err != nil {
-        log.Printf("[%s] !!! parse error=%v", corrId, err)
         return "I'm sorry, I encountered an error processing your request."
     }
 
-    log.Printf("[%s] === type=%s", corrId, resp.Type)
     switch resp.Type {
     case "capabilities": return formatCapabilities()
     case "decline":      return formatDecline(resp)
@@ -358,40 +417,50 @@ func handleMessage(agent *Agent, msg llp.TextMessage, annotater llp.Annotater) s
 }
 ```
 
-**Wire up LLP client in `main()`:**
+**Wire up LLP client — replaces the standalone `main()` from Step 2H.**
+
+Add to your import block:
+```go
+"context"
+"os/signal"
+"sync"
+"syscall"
+llp "github.com/llpsdk/llp-go"
+```
 
 ```go
-import llp "github.com/llpsdk/llp-go"
+func main() {
+    if err := godotenv.Load(); err != nil {
+        log.Println("No .env file found, using environment variables")
+    }
 
-client := llp.NewClient(
-    getEnv("AGENT_NAME", "<agent-name>"),
-    getEnv("AGENT_KEY", ""),
-    llp.Config{URL: getEnv("PLATFORM_ADDRESS", "ws://localhost:4000/agent/websocket")},
-)
+    agent := NewAgent()
 
-client.OnStart(func() *Agent { return NewAgent() })
-client.OnMessage(func(agent *Agent, msg llp.TextMessage, annotater llp.Annotater) llp.Reply {
-    return msg.Reply(handleMessage(agent, msg, annotater))
-})
-client.OnStop(func() { log.Println("session ended") })
+    ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer cancel()
 
-stop := make(chan os.Signal, 1)
-signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-go func() { <-stop; client.Close(); os.Exit(0) }()
+    client, err := llp.NewClient(getEnv("LLP_AGENT_NAME", "<agent-name>"), getEnv("LLP_API_KEY", "")).
+        OnMessage(func(ctx context.Context, msg llp.TextMessage) (llp.TextMessage, error) {
+            return msg.Reply(handleMessage(agent, msg)), nil
+        }).
+        Connect(ctx)
 
-if err := client.Connect(); err != nil {
-    log.Fatalf("Fatal error: %v", err)
+    if err != nil {
+        log.Fatalf("Fatal: %v", err)
+    }
+
+    log.Println("Agent connected")
+    <-ctx.Done()
+    client.Close()
 }
-select {}
 ```
 
 Additional env vars when using LLP:
 
 | Variable | Default |
 |----------|---------|
-| `AGENT_NAME` | `<agent-name>` |
-| `AGENT_KEY` | `""` |
-| `PLATFORM_ADDRESS` | `ws://localhost:4000/agent/websocket` |
+| `LLP_AGENT_NAME` | `<agent-name>` |
+| `LLP_API_KEY` | `""` |
 
 ---
 
@@ -409,9 +478,8 @@ Generate a dedicated directory named `<agent-name>/` containing:
 7. `Agent` struct + `NewAgent()` + `call()`
 8. Formatters
 9. `buildPrompt()`, `buildMessages()`, `extractJSON()`, `parseResponse()`
-10. `getEnv()`, `truncate()` (if LLP observability requested)
-11. `handleMessage()` (if LLP observability requested)
-12. `main()`
+10. `sessionStore` + `processMessage()` (standalone) — or `getEnv()` + `handleMessage()` (if LLP observability requested)
+11. `main()`
 
 Separate sections with:
 ```go
@@ -421,7 +489,20 @@ Separate sections with:
 ```
 
 Supporting files:
-- `go.mod` — `module <agent-name>`, `go 1.21`, `github.com/openai/openai-go`, `github.com/joho/godotenv`
+- `go.mod` — `module <agent-name>`, `go 1.21`, `github.com/openai/openai-go`, `github.com/joho/godotenv` (add `github.com/llpsdk/llp-go` if observability requested)
 - `.env.example` — all env vars with inline comments
 - `.gitignore` — binary output (e.g. `<agent-name>`) and `.env`
 - `README.md` — what it does, prerequisites (`go 1.21+`), `go mod tidy`, config table, `go run main.go`
+
+### Step 7 — Validate before calling it runnable
+
+Do not describe the scaffold as complete or runnable until it passes basic local validation.
+
+Minimum validation:
+- Run `go mod tidy`
+- Run `go build ./...`
+- If either command fails, fix the generated code and rerun validation
+
+In the final response:
+- State that validation passed
+- Mention any assumptions that were applied for omitted optional inputs
