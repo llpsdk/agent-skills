@@ -1,6 +1,6 @@
 ---
 name: Go Agent
-description: Scaffold a complete Go agent using the OpenAI SDK. Covers structured responses, tools, required in-session conversation history for multi-turn behavior, optional persistent memory, and optional LLP observability.
+description: Scaffold a complete Go agent using the OpenAI-compatible SDK against Ollama. Covers structured responses, tools, required in-session conversation history for multi-turn behavior, optional persistent memory, and optional Large Language Platform observability.
 license: MIT
 metadata:
     author: Large Language Platform, Inc.
@@ -9,11 +9,11 @@ metadata:
 
 # Go Agent
 
-Scaffold a complete, runnable Go agent using the OpenAI SDK.
+Scaffold a complete, runnable Go agent using the OpenAI-compatible SDK against Ollama.
 
 ## When to use
 
-- When building an agent in Go using the OpenAI SDK.
+- When building an agent in Go against an Ollama endpoint using the OpenAI-compatible SDK.
 - When you want structured responses, tool calling, and multi-turn behavior with in-session conversation history and minimal dependencies.
 
 ---
@@ -30,10 +30,10 @@ Ask only for the minimum needed to scaffold a useful first version. Do not block
 3. **Tools** — list the tools this agent needs. For each: name, description, inputs, return value. If the agent needs no tools, require the user to confirm that explicitly.
 
 **Optional:**
-4. **Model** — default: `gpt-4o-mini`
+4. **Model** — default: `gpt-oss:120b`
 5. **Response schema** — what structured data should the agent return? Default: derive from domain.
 6. **Persistent memory** — persist memory across sessions? Default: no.
-7. **LLP observability** — include LLP connectivity? Default: no.
+7. **Large Language Platform observability** — include Large Language Platform connectivity? Default: no.
 
 If the user does not specify an optional item, proceed with the default and note the assumption briefly. Do not proceed until the required tools input is provided. An explicit "no tools" answer satisfies that requirement and should produce an agent with no tool definitions or tool loop configuration.
 
@@ -183,16 +183,20 @@ Env defaults:
 
 | Variable | Default |
 |----------|---------|
-| `MODEL_NAME` | `gpt-4o-mini` |
-| `OPENAI_API_KEY` | `""` |
+| `MODEL` | `gpt-oss:120b` |
+| `MODEL_BASE_URL` | `https://ollama.com` |
+| `MODEL_API_KEY` | `your_ollama_api_key` |
 
 ---
 
-### Step 3 — OpenAI SDK implementation
+### Step 3 — Ollama implementation via the OpenAI-compatible SDK
 
 **Import:**
 ```go
 import (
+    "fmt"
+    "net/url"
+    "strings"
     "sync"
     "github.com/openai/openai-go"
     "github.com/openai/openai-go/option"
@@ -201,7 +205,25 @@ import (
 
 **Client init:**
 ```go
-client := openai.NewClient(option.WithAPIKey(os.Getenv("OPENAI_API_KEY")))
+func ollamaBaseURL() string {
+    base := strings.TrimRight(getEnv("MODEL_BASE_URL", "https://ollama.com"), "/")
+    if base == "" {
+        base = "https://ollama.com"
+    }
+    parsed, err := url.Parse(base)
+    if err != nil {
+        return "https://ollama.com/v1"
+    }
+    if !strings.HasSuffix(parsed.Path, "/v1") {
+        parsed.Path = strings.TrimRight(parsed.Path, "/") + "/v1"
+    }
+    return parsed.String()
+}
+
+client := openai.NewClient(
+    option.WithBaseURL(ollamaBaseURL()),
+    option.WithAPIKey(getEnv("MODEL_API_KEY", "")),
+)
 ```
 
 **Add client to Agent struct:**
@@ -212,10 +234,24 @@ type Agent struct {
 }
 ```
 
+**NewAgent constructor:**
+```go
+func NewAgent() *Agent {
+    client := openai.NewClient(
+        option.WithBaseURL(ollamaBaseURL()),
+        option.WithAPIKey(getEnv("MODEL_API_KEY", "")),
+    )
+
+    return &Agent{
+        client: &client,
+        model:  getEnv("MODEL", "gpt-oss:120b"),
+    }
+}
+```
+
 **Tool definitions** — declare as a package-level variable so it's accessible from both `main()` and `handleMessage()`:
 ```go
 var toolDefs = []openai.ChatCompletionToolParam{{
-    Type: "function",
     Function: openai.FunctionDefinitionParam{
         Name:        "tool_name",
         Description: openai.String("What this tool does and when to use it."),
@@ -235,12 +271,14 @@ var toolDefs = []openai.ChatCompletionToolParam{{
 func (a *Agent) call(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, toolDefs []openai.ChatCompletionToolParam) (string, error) {
     for {
         params := openai.ChatCompletionNewParams{
-            Model:    openai.F(a.model),
-            Messages: openai.F(messages),
+            Model:    a.model,
+            Messages: messages,
         }
         if len(toolDefs) > 0 {
-            params.Tools = openai.F(toolDefs)
-            params.ToolChoice = openai.F[openai.ChatCompletionToolChoiceOptionUnionParam](openai.ChatCompletionToolChoiceOptionAutoParam("auto"))
+            params.Tools = toolDefs
+            params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{
+                OfAuto: openai.String("auto"),
+            }
         }
 
         resp, err := a.client.Chat.Completions.New(ctx, params)
@@ -257,11 +295,13 @@ func (a *Agent) call(ctx context.Context, messages []openai.ChatCompletionMessag
         messages = append(messages, choice.Message.ToParam())
         for _, tc := range choice.Message.ToolCalls {
             result := dispatchTool(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
-            messages = append(messages, openai.ToolMessage(tc.ID, result))
+            messages = append(messages, openai.ToolMessage(result, tc.ID))
         }
     }
 }
 ```
+
+Use the Chat Completions API shape shown above for OpenAI-compatible backends. If the selected backend requires a different API surface or URL shape, adapt the scaffold accordingly.
 
 **Multi-turn:** Maintain a `[]openai.ChatCompletionMessageParamUnion` slice per session. Append raw user and assistant turns after each exchange.
 
@@ -358,7 +398,7 @@ Always wrap memory retrieval in error handling — a failure must never block th
 
 ### Step 5 — Observability (optional)
 
-Add LLP platform connectivity for managed routing, tool-call tracing, and observability after the core agent is working.
+Add Large Language Platform connectivity for managed routing, tool-call tracing, and observability after the core agent is working.
 
 **Add dependency:** `github.com/llpsdk/llp-go`
 
@@ -381,7 +421,7 @@ func getEnv(key, fallback string) string {
 }
 ```
 
-`handleMessage` is the LLP equivalent of `processMessage` — it replaces it when using LLP, reusing the same session store keyed by `msg.Sender`:
+`handleMessage` is the Large Language Platform equivalent of `processMessage` — it replaces it when using Large Language Platform, reusing the same session store keyed by `msg.Sender`:
 ```go
 var sessions = newSessionStore()
 ```
@@ -417,7 +457,7 @@ func handleMessage(agent *Agent, msg llp.TextMessage) string {
 }
 ```
 
-**Wire up LLP client — replaces the standalone `main()` from Step 2H.**
+**Wire up the Large Language Platform client — replaces the standalone `main()` from Step 2H.**
 
 Add to your import block:
 ```go
@@ -455,12 +495,15 @@ func main() {
 }
 ```
 
-Additional env vars when using LLP:
+Additional env vars when using Large Language Platform:
 
 | Variable | Default |
 |----------|---------|
 | `LLP_AGENT_NAME` | `<agent-name>` |
 | `LLP_API_KEY` | `""` |
+| `MODEL` | `gpt-oss:120b` |
+| `MODEL_BASE_URL` | `https://ollama.com` |
+| `MODEL_API_KEY` | `your_ollama_api_key` |
 
 ---
 
@@ -478,7 +521,7 @@ Generate a dedicated directory named `<agent-name>/` containing:
 7. `Agent` struct + `NewAgent()` + `call()`
 8. Formatters
 9. `buildPrompt()`, `buildMessages()`, `extractJSON()`, `parseResponse()`
-10. `sessionStore` + `processMessage()` (standalone) — or `getEnv()` + `handleMessage()` (if LLP observability requested)
+10. `sessionStore` + `processMessage()` (standalone) — or `getEnv()` + `handleMessage()` (if Large Language Platform observability requested)
 11. `main()`
 
 Separate sections with:
@@ -493,6 +536,14 @@ Supporting files:
 - `.env.example` — all env vars with inline comments
 - `.gitignore` — binary output (e.g. `<agent-name>`) and `.env`
 - `README.md` — what it does, prerequisites (`go 1.21+`), `go mod tidy`, config table, `go run main.go`
+
+`.env.example` must use the generic model env names and include inline comments that explain the API key clearly. Be explicit that `MODEL_API_KEY` is required for direct access to `https://ollama.com`, but typically not needed for a local Ollama server at `http://localhost:11434`. Tell the user to create the key from their ollama.com account API key settings before running the agent against Ollama Cloud.
+
+```dotenv
+MODEL=gpt-oss:120b
+MODEL_BASE_URL=https://ollama.com
+MODEL_API_KEY=your_ollama_api_key # Required for direct access to https://ollama.com. Create this in your ollama.com account API key settings. For local Ollama at http://localhost:11434, this is usually not needed.
+```
 
 ### Step 7 — Validate before calling it runnable
 
