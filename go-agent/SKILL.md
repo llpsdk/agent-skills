@@ -1,5 +1,5 @@
 ---
-name: Go Agent
+name: go-agent
 description: Scaffold a complete Go agent using the OpenAI-compatible SDK against Ollama. Covers structured responses, tools, required in-session conversation history for multi-turn behavior, optional persistent memory, and optional Large Language Platform observability.
 license: MIT
 metadata:
