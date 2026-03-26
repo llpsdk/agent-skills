@@ -1,10 +1,10 @@
 ---
 name: Mastra Agent
-description: Scaffold a complete TypeScript agent using the Mastra framework. Covers structured responses, tools, multi-turn conversation, and optional Large Language Platform observability.
+description: Scaffold a complete TypeScript agent using the Mastra framework. Covers tools, multi-turn conversation, and optional Large Language Platform observability.
 license: MIT
 metadata:
     author: Large Language Platform, Inc.
-    version: 0.2.0
+    version: 0.3.0
 ---
 
 # Mastra Agent
@@ -14,7 +14,7 @@ Scaffold a complete, runnable TypeScript agent using [Mastra](https://mastra.ai)
 ## When to use
 
 - When building a TypeScript agent with the Mastra framework.
-- When you want structured responses, tool calling, and optional multi-turn conversation with minimal boilerplate.
+- When you want tool calling and optional multi-turn conversation with minimal boilerplate.
 
 ---
 
@@ -41,8 +41,8 @@ If the user provides an exact `provider/model` string, use it as-is. If they nam
 4. **Tools** — list the tools this agent needs. For each: name, description, inputs, return value. If the agent needs no tools, confirm this explicitly.
 
 **Optional:**
-5. **Response schema** — what structured data should the agent return? Default: derive from domain.
-6. **Multi-turn** — maintain conversation history within a session? Default: no.
+5. **Multi-turn** — maintain conversation history within a session? Default: no.
+6. **Structured output** — return typed structured data instead of plain text? Default: no (use `result.text`).
 
 **Derived from LLM choice:**
 
@@ -65,54 +65,43 @@ Use this convention throughout the generated `.env.example`, env table, and READ
 Every Mastra agent follows this pattern:
 
 ```
-User message → agent.generate(prompt, { output }) → [tool calls, automatic] → result.object → format → reply
+User message → agent.generate(prompt) → [tool calls, automatic] → result.text → reply
 ```
 
-#### A. Structured responses
+#### A. System prompt
 
-Mastra supports native structured output — pass a Zod schema as the `output` option to `agent.generate()` and access the typed result via `result.object`. No JSON instructions in the prompt, no manual parsing.
-
-Design a Zod discriminated union schema that captures what matters for the domain. Use a `type` literal field to distinguish response kinds:
-
-**Example** (adapt to the domain — do not copy literally):
-```ts
-const responseSchema = z.union([
-    z.object({
-        type: z.literal('analysis'),
-        category: z.string(),
-        recommendation: z.string(),
-        considerations: z.array(z.string()),
-    }),
-    z.object({
-        type: z.literal('capabilities'),
-    }),
-    z.object({
-        type: z.literal('decline'),
-        reason: z.string(),
-    }),
-]);
-type AgentResponse = z.infer<typeof responseSchema>;
-```
-
-#### B. System prompt
-
-The system prompt should focus on **behaviour**, not output format (the Zod schema handles that via structured output):
+The system prompt defines the agent's behaviour and domain rules:
 - Define the agent's expertise and domain
 - State behavioural rules (what the agent will and won't do)
 - Describe when to use tools and when to decline
+- Keep it concise — the LLM generates plain text responses by default
 
-Do NOT include JSON format instructions or schema examples in the system prompt.
+```ts
+const SYSTEM_PROMPT = `
+You are a helpful [domain expert] that gives succinct responses.
 
-#### C. Tools
+Important rules:
+1. Use the [tool_name] tool for every [domain] question about a supported [entity].
+2. Supported [entities] are [list].
+3. If the [entity] is unsupported, decline and mention the supported [entities].
+4. If the question is not about [domain], decline.
+5. Keep responses concise and practical.
+`;
+```
+
+#### B. Tools
 
 Tools are functions the LLM calls to fetch external data or take actions. Mastra handles the tool loop automatically — define tools and the agent decides when to invoke them.
 
 Design principles:
 - One tool, one responsibility
+- Define a type for the tool's return value
 - **Catch all errors inside the tool** and return a graceful error string — never throw to the agent
 
 ```ts
 import { createTool } from '@mastra/core/tools';
+
+type MyToolResult = { field1: string; field2: number };
 
 const myTool = createTool({
     id: 'tool_name',
@@ -120,7 +109,8 @@ const myTool = createTool({
     inputSchema: z.object({ param: z.string().describe('Description of param') }),
     execute: async ({ context }) => {
         try {
-            return await doWork(context.param);
+            const data = await doWork(context.param);
+            return data;
         } catch (err) {
             return `Tool error: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -128,14 +118,16 @@ const myTool = createTool({
 });
 ```
 
-#### D. Agent factory
+> **Note:** When Large Language Platform observability is used (Step 4), the `execute` function is wrapped differently — see that section for the updated tool pattern.
+
+#### C. Agent factory
 
 Mastra's model router accepts a string in the format `provider/model-name` and handles provider resolution and API key lookup automatically (see Step 1 for provider prefix → env var mapping).
 
 ```ts
 import { Agent } from '@mastra/core/agent';
 
-function createAdvisorAgent(model: string) {
+function createMyAgent(model: string) {
     return new Agent({
         id: '<agent-name>',
         name: '<agent-name>',
@@ -144,46 +136,55 @@ function createAdvisorAgent(model: string) {
         tools: { tool_name: myTool },   // omit or use {} if no tools
     });
 }
-type AdvisorAgent = ReturnType<typeof createAdvisorAgent>;
+type MyAgent = ReturnType<typeof createMyAgent>;
 ```
 
-#### E. LLM call with structured output
+#### D. Handling messages
 
-Pass the Zod schema as the `output` option. The result's `.object` property contains the typed, validated data:
+The agent generates a plain text response. Access it via `result.text`:
 
 ```ts
-const result = await agent.generate(message, {
-    output: responseSchema,
-});
-const response = result.object as AgentResponse;
+async function handleMessage(agent: MyAgent, prompt: string): Promise<string> {
+    try {
+        const result = await agent.generate(prompt);
+        return result.text;
+    } catch (error) {
+        console.error('Agent execution failed:', error);
+        return "I'm sorry, I encountered an error processing your request.";
+    }
+}
 ```
 
-For plain text responses (no structured output), use `result.text` instead:
+#### E. Entry point
+
+Use the ESM-compatible dotenv pattern and a keep-alive promise:
 
 ```ts
-const result = await agent.generate(message);
-const text = result.text;
-```
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { config } from 'dotenv';
 
-#### F. Response formatters
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+config({ path: join(__dirname, '.env') });
 
-```ts
-function formatCapabilities(): string { /* bullet list of what the agent can help with */ }
-function formatResult(r: Extract<AgentResponse, { type: 'analysis' }>): string { /* domain-specific fields as plain text */ }
-function formatDecline(r: Extract<AgentResponse, { type: 'decline' }>): string { return r.reason; }
-```
-
-Always append: `"Note: This is educational information, not personalised advice."` where appropriate.
-
-#### G. Entry point
-
-```ts
 async function main(): Promise<void> {
     const model = process.env.MODEL_NAME ?? 'ollama-cloud/gpt-oss:120b';
-    const agent = createAdvisorAgent(model);
+    const agent = createMyAgent(model);
 
     // wire up your I/O here (HTTP, stdin, WebSocket, etc.)
+
+    try {
+        console.log(`Agent initialized model=${model}`);
+        // start your server/client here
+        await new Promise(() => {}); // keep-alive
+    } catch (error) {
+        console.error('Fatal error:', error);
+        process.exit(1);
+    }
 }
+
+void main();
 ```
 
 Env defaults:
@@ -195,34 +196,90 @@ Env defaults:
 
 ---
 
-### Step 3 — Optional building blocks
+### Step 3 — Optional enhancements
 
 #### Multi-turn conversation
 
 Pass `threadId` to `agent.generate()` — Mastra manages conversation history internally, no manual message array needed:
 
 ```ts
-const result = await agent.generate(message, {
+const result = await agent.generate(prompt, {
     threadId: sessionId,      // stable per-session identifier (e.g. sender ID)
     resourceId: agentName,
 });
 ```
 
+#### Structured output
+
+If the user requested structured output, pass a Zod schema as the `output` option to `agent.generate()` and access the typed result via `result.object` instead of `result.text`:
+
+```ts
+const responseSchema = z.union([
+    z.object({
+        type: z.literal('analysis'),
+        category: z.string(),
+        recommendation: z.string(),
+    }),
+    z.object({
+        type: z.literal('decline'),
+        reason: z.string(),
+    }),
+]);
+type AgentResponse = z.infer<typeof responseSchema>;
+
+const result = await agent.generate(prompt, {
+    output: responseSchema,
+});
+const response = result.object as AgentResponse;
+```
+
+When using structured output:
+- Do NOT include JSON format instructions in the system prompt — the Zod schema handles format enforcement at the provider level
+- Add response formatters to convert the typed object to a human-readable string for display
+
 ---
 
-### Step 4 — Observability (optional)
+### Step 4 — Large Language Platform observability (optional)
 
 Add Large Language Platform connectivity for managed routing, tool-call tracing, and observability after the core agent is working.
 
-**Add dependencies:** `llpsdk`
+**Add dependency:** `llpsdk`
 
-**Implement `handleMessage(agent, message, annotater)`:**
+#### Wrap tools with annotation tracing
+
+When using Large Language Platform, replace the standard `execute` function with `wrapWithLLPAnnotation`. This changes the signature — the wrapped function receives `inputData` directly (not `{ context }`):
+
+```ts
+import { wrapWithLLPAnnotation } from 'llpsdk/mastra';
+
+type MyToolResult = { field1: string; field2: number };
+
+const myTool = createTool({
+    id: 'tool_name',
+    description: 'What this tool does and when to use it.',
+    inputSchema: z.object({ param: z.string() }),
+    execute: wrapWithLLPAnnotation<{ param: string }, MyToolResult>(
+        'tool_name',
+        async (inputData) => {
+            return await doWork(inputData.param);
+        },
+    ),
+});
+```
+
+#### Implement `handleMessage`
+
+Add `RequestContext` to pass LLP tracing context through the agent call:
 
 ```ts
 import { RequestContext } from '@mastra/core/request-context';
 import { type LLPMastraContext } from 'llpsdk/mastra';
 
-async function handleMessage(agent: AdvisorAgent, message: TextMessage, annotater: Annotater): Promise<string> {
+async function handleMessage(
+    agent: MyAgent,
+    message: TextMessage,
+    annotater: Annotater,
+): Promise<string> {
     const requestContext = new RequestContext<LLPMastraContext>();
     requestContext.set('llpMessage', message);
     requestContext.set('llpAnnotater', annotater);
@@ -237,43 +294,44 @@ async function handleMessage(agent: AdvisorAgent, message: TextMessage, annotate
 }
 ```
 
-**Wrap tools with annotation tracing:**
+#### Wire up the LLP client in `main()`
 
-```ts
-import { wrapWithLLPAnnotation } from 'llpsdk/mastra';
-
-const myTool = createTool({
-    id: 'tool_name',
-    description: '...',
-    inputSchema: z.object({ param: z.string() }),
-    execute: wrapWithLLPAnnotation<{ param: string }, string>(
-        'tool_name',
-        async (inputData) => {
-            try { return await doWork(inputData.param); }
-            catch (err) { return `Tool error: ${err instanceof Error ? err.message : String(err)}`; }
-        }
-    ),
-});
-```
-
-**Wire up the Large Language Platform client in `main()`:**
+The LLP client manages the agent lifecycle — `onStart` creates the agent, `onMessage` handles each incoming message, `onStop` runs cleanup:
 
 ```ts
 import { type Annotater, LLPClient, type TextMessage } from 'llpsdk';
 
-const agentName = process.env.AGENT_NAME ?? '<agent-name>';
-const apiKey = process.env.LLP_API_KEY ?? '';
+async function main(): Promise<void> {
+    const agentName = process.env.AGENT_NAME ?? '<agent-name>';
+    const apiKey = process.env.LLP_API_KEY ?? '';
+    const model = process.env.MODEL_NAME ?? 'ollama-cloud/gpt-oss:120b';
 
-const client = new LLPClient(agentName, apiKey)
-    .onStart(() => createAdvisorAgent(model))
-    .onMessage(async (agent, msg, annotater) => {
-        const response = await handleMessage(agent, msg, annotater);
-        return msg.reply(response);
-    })
-    .onStop(() => console.log('session ended'));
+    if (!apiKey) {
+        throw new Error('LLP_API_KEY env var is not defined');
+    }
 
-await client.connect();
-await new Promise(() => {});
+    const client = new LLPClient(agentName, apiKey)
+        .onStart(() => createMyAgent(model))
+        .onMessage(async (agent, msg, annotater) => {
+            const response = await handleMessage(agent, msg, annotater);
+            return msg.reply(response);
+        })
+        .onStop(() => {
+            console.log('session ended');
+        });
+
+    try {
+        console.log(`Agent initialized model=${model}`);
+        await client.connect();
+        console.log('Connected to platform');
+        await new Promise(() => {});
+    } catch (error) {
+        console.error('Fatal error:', error);
+        process.exit(1);
+    }
+}
+
+void main();
 ```
 
 Additional env vars when using Large Language Platform:
@@ -293,15 +351,14 @@ Generate a dedicated directory named `<agent-name>/` containing:
 
 **`<agent-name>.ts`** — single source file, sections in this order:
 1. Imports
-2. Dotenv config load
+2. Dotenv config load (`dirname`/`fileURLToPath` pattern for ESM)
 3. `SYSTEM_PROMPT`
-4. Zod schema + types
+4. Domain data + types
 5. Tool definitions (if any)
 6. Agent factory + type
-7. Response formatters
-8. `handleMessage()` (if Large Language Platform observability was requested)
-9. `main()`
-10. `void main()`
+7. `handleMessage()`
+8. `main()`
+9. `void main()`
 
 Separate sections with:
 ```ts
@@ -311,10 +368,17 @@ Separate sections with:
 ```
 
 **Supporting files:**
-- `package.json` — dependencies: `@mastra/core`, `zod`, `dotenv` (add `llpsdk` if observability requested); devDependencies: `tsx`, `typescript`; script: `"start": "tsx <agent-name>.ts"`
+- `package.json` — dependencies: `@mastra/core`, `zod`, `dotenv` (add `llpsdk` if observability requested); devDependencies: `tsx`, `typescript`, `@types/node`; script: `"start": "tsx <agent-name>.ts"`; set `"type": "module"`
 - `tsconfig.json` — target ES2022, module NodeNext, strict true, include `["<agent-name>.ts"]`
 - `.env.example` — all env vars with inline comments
-- `.gitignore` — `node_modules/` and `.env`
-- `README.md` — what it does, prerequisites, setup steps, config table, `npm start`
+- `README.md` — what it does, prerequisites, setup steps, config table, and exact run instructions
 
 `.env.example` must include the correct `{PROVIDER}_API_KEY` variable for the chosen model provider (see Step 1 table) with an inline comment explaining what it is for and how to obtain it.
+
+`README.md` must include:
+- a short description of the agent and its tools
+- prerequisites, including Node.js and any required provider/API setup
+- setup steps: `cd <agent-name>`, `npm install`, copy `.env.example` to `.env`, fill in env vars
+- a configuration table documenting every env var used by the example
+- a run section showing `npm start`
+- a brief note explaining what the agent will do when it receives a message
